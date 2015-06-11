@@ -48,7 +48,7 @@
   (not (eql #\" char)))
 
 (defun not-bracket (char)
-  (not (eql #\] char)))
+  (not (or (eql #\] char) (eql #\[ char))))
 
 (defun not-integer (string)
   (when (find-if-not #'digit-char-p string)
@@ -258,6 +258,14 @@
     (list :header
           (text name))))
 
+;; aka array of tables in 0.2.0
+(defrule array-keygroup
+    (and (? whitespace) #\[ #\[ (+ keygroup-char) #\] #\] (? whitespace))
+  (:destructure (_1 _2 _3 name _4 _5 _6)
+    (declare (ignore _1 _2 _3 _4 _5 _6))
+    (list :header-array
+          (text name))))
+
 (defrule preamble
     (* keyvalue))
 
@@ -267,19 +275,33 @@
      preamble
      ;; interleaving
      (* (and
-         keygroup
+         (or keygroup array-keygroup)
          (* keyvalue)))))
 
 (defun parse-string (string)
   "Returns the toml parsed structure from `string` or :parse-error"
   (parse 'file-grammar string))
 
+(defun insert-keyvalue (key value table)
+  "Insert a value into a hash-table with key of KEY, asserting that
+the key does not already exist. Processes value with
+PROCESS-VALUE-DATA before insertion."
+  (multiple-value-bind (value gotten)
+      (gethash key table)
+    (declare (ignore value))
+    ;; Duplicate value detection!
+    (assert (not gotten)))
+  (setf (gethash key table)
+        ;; collapse values from the (:type <stuff>)
+        ;; information
+        (process-value-data value)))
+
 ;;; Semantic analysis tools
 ;;; Lexing and parsing are over, time for the hard stuff. :)
 (defun extract-lisp-structure (parsed-structure)
   ;; Expecting parsed-structure to be two lists of lists. List 1
   ;; will be the keys not belonging to a top-level value. List 2 is
-  ;; teh list of values belonging to top-level keys.
+  ;; the list of values belonging to top-level keys.
   (let ((table (make-hash-table
                 ;; Will be comparing strings for the keys
                 :test #'equal)))
@@ -298,31 +320,32 @@
     ;; [h1.h2] key1 = t => h1.h2.key1
     (loop for header in (second parsed-structure)
        do
-
-         (assert (eq (caar header) :header))
          (let ((keygroup-header (cadar header))
                (section (cadr header)))
+           (ecase (caar header)
+             (:header
+              (unless section
+                (setf (gethash keygroup-header table)
+                      (make-hash-table :test #'equal)))
 
-           (unless section
-             (setf (gethash keygroup-header table)
-                   (make-hash-table :test #'equal)))
-
-           (loop for keyvalue in section do
-                (assert (eq (first keyvalue) :keyvalue))
-                (let ((key
-                       ;; Format the key
-                       (format nil "~a.~a"
-                               keygroup-header
-                               (second keyvalue))))
-                  (multiple-value-bind (value gotten)
-                      (gethash key table)
-                    (declare (ignore value))
-                    ;; Duplicate value detection!
-                    (assert (not gotten) ))
-                  (setf (gethash key table)
-                       ;; collapse values from the (:type <stuff>)
-                       ;; information.
-                       (process-value-data (third keyvalue)))))))
+              (loop for keyvalue in section do
+                   (assert (eq (first keyvalue) :keyvalue))
+                   (let ((key
+                          ;; Format the key
+                          (format nil "~a.~a"
+                                  keygroup-header
+                                  (second keyvalue))))
+                     (insert-keyvalue key (third keyvalue) table))))
+             (:header-array
+              (let ((sub-table (make-hash-table :test #'equal))
+                    (array (gethash keygroup-header table)))
+                ;; key should not already be a table
+                (assert (listp array))
+                (loop for keyvalue in section do
+                     (assert (eq (first keyvalue) :keyvalue))
+                     (insert-keyvalue (second keyvalue) (third keyvalue) sub-table))
+                (setf (gethash keygroup-header table)
+                      (nconc array (list sub-table))))))))
 
     ;; break!  at this point: we have a flat common lisp hash table,
     ;; no duplicate keys. each value is a lisp value correctly
@@ -408,6 +431,7 @@ Toml does not support references  as of v0.1, and there for we can traverse arra
 
 `strict` is not supported at present.
 "
+  (declare (ignorable strict))
   (let ((postfix-newlined-string
           (cl-ppcre:regex-replace-all "\\b\\s*$" string
                                       (concatenate 'string '(#\Newline)))))
